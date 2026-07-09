@@ -1,361 +1,443 @@
 #!/usr/bin/env python3
 """
-eSSL Biometric Device -> SQL Server Sync Tool
-================================================
+eSSL / ZKTeco Biometric Device -> Frappe/ERPNext Employee Checkin Sync
+========================================================================
 
-Connects to an eSSL (ZK-protocol / TCP-IP) biometric attendance device, pulls
-punch/attendance logs, and inserts new records into a SQL Server database
-(by default matching the standard "iclock" CHECKINOUT table schema used by
-eTimeTrackLite and similar eSSL/ZKTeco based attendance software).
+Reads attendance punches off an eSSL (ZK-protocol) biometric device over
+TCP/IP and pushes them into a Frappe/ERPNext site as "Employee Checkin"
+records via the REST API.
 
-USAGE
------
-    python essl_sync.py --test-device      Test connection to the biometric device only
-    python essl_sync.py --test-db          Test connection to SQL Server only
-    python essl_sync.py --sync-once        Pull attendance and sync to DB one time, then exit
-    python essl_sync.py --run              Sync once, then keep polling every N minutes (see config.ini)
-    python essl_sync.py --list-users       Print enrolled users on the device
+Configuration is read from a `.env` file (see env.example) in the same
+directory as this script, or from real environment variables if already
+set (systemd EnvironmentFile= also works with this format).
 
-All settings (device IP, DB connection, table/column names, poll interval, etc.)
-live in config.ini next to this script - edit that file before running.
+Usage:
+    python essl_sync.py --test-device      # verify device connectivity
+    python essl_sync.py --test-frappe      # verify Frappe API connectivity
+    python essl_sync.py --list-users       # list users enrolled on the device
+    python essl_sync.py --sync-once        # pull + push once, then exit
+    python essl_sync.py --run              # loop forever, polling every N minutes
+    python essl_sync.py                    # same as --sync-once (default)
 
-REQUIREMENTS
-------------
-    pip install -r requirements.txt
-
-    You also need the SQL Server ODBC driver installed on this machine
-    (e.g. "ODBC Driver 17 for SQL Server" - downloadable from Microsoft).
+Requires:
+    pip install -r requirement.txt
 """
 
 import argparse
 import configparser
+import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import requests
 
 try:
     from zk import ZK, const
 except ImportError:
-    print("Missing dependency 'pyzk'. Run: pip install -r requirements.txt")
-    sys.exit(1)
-
-try:
-    import pyodbc
-except ImportError:
-    print("Missing dependency 'pyodbc'. Run: pip install -r requirements.txt")
+    print("ERROR: the 'pyzk' package is required. Run: pip install pyzk")
     sys.exit(1)
 
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_FILE = SCRIPT_DIR / ".env"
+STATE_FILE = SCRIPT_DIR / "sync_state.json"
+LOG_FILE = SCRIPT_DIR / "essl_sync.log"
 
 
-# ------------------------------------------------------------------------- #
-# Config / logging setup
-# ------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
+# Config loading (.env style: KEY=VALUE, # comments, blank lines ignored)
+# ---------------------------------------------------------------------------
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        print(f"Config file not found: {CONFIG_PATH}")
-        sys.exit(1)
-    cfg = configparser.ConfigParser()
-    cfg.read(CONFIG_PATH)
+def load_env_file(path: Path) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (without
+    overwriting variables that are already set in the real environment,
+    so systemd EnvironmentFile= or exported shell vars still win)."""
+    if not path.exists():
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def get_config() -> dict:
+    load_env_file(ENV_FILE)
+
+    def env(name, default=None, required=False):
+        val = os.environ.get(name, default)
+        if required and (val is None or val == ""):
+            print(f"ERROR: required config value '{name}' is missing. "
+                  f"Set it in {ENV_FILE} or as an environment variable.")
+            sys.exit(1)
+        return val
+
+    def env_bool(name, default=False):
+        val = os.environ.get(name)
+        if val is None:
+            return default
+        return val.strip().lower() in ("1", "true", "yes", "on")
+
+    def env_int(name, default):
+        val = os.environ.get(name)
+        if val is None or val == "":
+            return default
+        try:
+            return int(val)
+        except ValueError:
+            return default
+
+    cfg = {
+        "device_ip": env("DEVICE_IP", required=True),
+        "device_port": env_int("DEVICE_PORT", 4370),
+        "device_password": env_int("DEVICE_PASSWORD", 0),
+        "device_timeout": env_int("DEVICE_TIMEOUT", 10),
+        "device_force_udp": env_bool("DEVICE_FORCE_UDP", False),
+
+        "frappe_url": env("FRAPPE_URL", required=True).rstrip("/"),
+        "frappe_api_key": env("FRAPPE_API_KEY", required=True),
+        "frappe_api_secret": env("FRAPPE_API_SECRET", required=True),
+
+        "initial_sync_days": env_int("INITIAL_SYNC_DAYS", 7),
+        "clear_device_logs": env_bool("CLEAR_DEVICE_LOGS", False),
+        "poll_interval_minutes": env_int("POLL_INTERVAL_MINUTES", 5),
+        "log_level": env("LOG_LEVEL", "INFO"),
+    }
     return cfg
 
 
-def setup_logging(cfg):
-    log_file = cfg.get("Logging", "log_file", fallback="essl_sync.log")
-    log_level = cfg.get("Logging", "log_level", fallback="INFO").upper()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+def setup_logging(log_level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("essl_sync")
+    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
 
-# ------------------------------------------------------------------------- #
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(fmt)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# Sync state (tracks last-synced timestamp so repeated runs don't duplicate)
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
 # Device connection
-# ------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 
-def connect_device(cfg):
-    ip = cfg.get("Device", "ip")
-    port = cfg.getint("Device", "port", fallback=4370)
-    password = cfg.getint("Device", "password", fallback=0)
-    timeout = cfg.getint("Device", "timeout", fallback=10)
-    force_udp = cfg.getboolean("Device", "force_udp", fallback=False)
-
-    logging.info(f"Connecting to eSSL device at {ip}:{port} ...")
+def connect_device(cfg: dict):
     zk = ZK(
-        ip,
-        port=port,
-        timeout=timeout,
-        password=password,
-        force_udp=force_udp,
+        cfg["device_ip"],
+        port=cfg["device_port"],
+        timeout=cfg["device_timeout"],
+        password=cfg["device_password"],
+        force_udp=cfg["device_force_udp"],
         ommit_ping=False,
     )
-    conn = zk.connect()
-    logging.info("Device connection established.")
-    return conn
+    return zk.connect()
 
 
-# ------------------------------------------------------------------------- #
-# Database connection
-# ------------------------------------------------------------------------- #
+def test_device(cfg: dict, logger: logging.Logger) -> bool:
+    logger.info(f"Testing device connection to {cfg['device_ip']}:{cfg['device_port']} ...")
+    try:
+        conn = connect_device(cfg)
+        info = {
+            "firmware_version": conn.get_firmware_version(),
+            "serial_number": conn.get_serialnumber(),
+            "device_name": conn.get_device_name(),
+            "platform": conn.get_platform(),
+        }
+        logger.info(f"Device OK: {info}")
+        conn.disconnect()
+        return True
+    except Exception as e:
+        logger.error(f"Device connection FAILED: {e}")
+        return False
 
-def get_db_connection(cfg):
-    server = cfg.get("Database", "server")
-    database = cfg.get("Database", "database")
-    driver = cfg.get("Database", "odbc_driver", fallback="ODBC Driver 17 for SQL Server")
-    use_windows_auth = cfg.getboolean("Database", "use_windows_auth", fallback=False)
 
-    if use_windows_auth:
-        conn_str = (
-            f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};"
-            f"Trusted_Connection=yes;"
+def list_users(cfg: dict, logger: logging.Logger) -> bool:
+    try:
+        conn = connect_device(cfg)
+        conn.disable_device()
+        users = conn.get_users()
+        conn.enable_device()
+        conn.disconnect()
+        if not users:
+            logger.info("No users enrolled on device.")
+            return True
+        logger.info(f"{len(users)} user(s) enrolled on device:")
+        for u in users:
+            logger.info(f"  uid={u.uid} user_id={u.user_id} name={u.name!r} privilege={u.privilege}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to list users: {e}")
+        return False
+
+
+def fetch_attendance(cfg: dict, logger: logging.Logger):
+    """Connect to the device and pull all attendance records currently
+    stored on it. Filtering by 'since last sync' happens after this,
+    in Python, since most eSSL/ZK devices don't support server-side
+    filtering of the attendance log."""
+    conn = connect_device(cfg)
+    try:
+        conn.disable_device()  # prevents new punches from being lost mid-read
+        records = conn.get_attendance()
+    finally:
+        try:
+            conn.enable_device()
+        except Exception:
+            pass
+
+    if cfg["clear_device_logs"]:
+        try:
+            conn.clear_attendance()
+            logger.info("Device attendance log cleared after read.")
+        except Exception as e:
+            logger.error(f"Failed to clear device log: {e}")
+
+    conn.disconnect()
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Frappe API
+# ---------------------------------------------------------------------------
+
+def frappe_headers(cfg: dict) -> dict:
+    return {
+        "Authorization": f"token {cfg['frappe_api_key']}:{cfg['frappe_api_secret']}",
+        "Content-Type": "application/json",
+    }
+
+
+def test_frappe(cfg: dict, logger: logging.Logger) -> bool:
+    url = f"{cfg['frappe_url']}/api/method/frappe.auth.get_logged_user"
+    logger.info(f"Testing Frappe connection to {cfg['frappe_url']} ...")
+    try:
+        resp = requests.get(url, headers=frappe_headers(cfg), timeout=15)
+        if resp.status_code == 200:
+            logger.info(f"Frappe OK: authenticated as {resp.json().get('message')}")
+            return True
+        logger.error(f"Frappe auth FAILED: HTTP {resp.status_code} - {resp.text[:300]}")
+        return False
+    except requests.RequestException as e:
+        logger.error(f"Frappe connection FAILED: {e}")
+        return False
+
+
+def push_checkin(cfg: dict, logger: logging.Logger, user_id: str, timestamp: datetime,
+                  log_type: str = None) -> bool:
+    """Create an Employee Checkin record in Frappe for one punch.
+    Returns True on success (including 'already exists'), False on failure."""
+    url = f"{cfg['frappe_url']}/api/resource/Employee Checkin"
+    payload = {
+        "employee_field_value": user_id,
+        "employee_fieldname": "attendance_device_id",
+        "time": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if log_type in ("IN", "OUT"):
+        payload["log_type"] = log_type
+
+    try:
+        resp = requests.post(url, headers=frappe_headers(cfg), json=payload, timeout=20)
+    except requests.RequestException as e:
+        logger.error(f"user={user_id} time={timestamp} -> network error pushing to Frappe: {e}")
+        return False
+
+    if resp.status_code in (200, 201):
+        resp_id = resp.json().get("data", {}).get("name", "?")
+        logger.info(f"SYNCED user={user_id} time={timestamp} -> Employee Checkin {resp_id}")
+        return True
+
+    body = resp.text[:500]
+
+    # Frappe raises a DuplicateEntryError-style message when the same
+    # employee+time checkin already exists; treat that as a harmless
+    # "already synced" case rather than a failure.
+    if resp.status_code == 409 or "duplicate" in body.lower():
+        logger.info(f"SKIP (already exists) user={user_id} time={timestamp}")
+        return True
+
+    if "attendance_device_id" in body.lower() and resp.status_code == 417:
+        logger.error(
+            f"FAILED user={user_id} time={timestamp} -> no Employee found with "
+            f"attendance_device_id='{user_id}'. Check Employee master data in Frappe."
         )
+        return False
+
+    logger.error(f"FAILED user={user_id} time={timestamp} -> HTTP {resp.status_code}: {body}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Core sync logic
+# ---------------------------------------------------------------------------
+
+def run_sync_once(cfg: dict, logger: logging.Logger) -> None:
+    state = load_state()
+    last_synced_str = state.get("last_synced_timestamp")
+
+    if last_synced_str:
+        since = datetime.fromisoformat(last_synced_str)
     else:
-        username = cfg.get("Database", "username")
-        password = cfg.get("Database", "password")
-        conn_str = (
-            f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};"
-            f"UID={username};PWD={password};"
+        since = datetime.now() - timedelta(days=cfg["initial_sync_days"])
+        logger.info(
+            f"No previous sync state found. First run will look back "
+            f"{cfg['initial_sync_days']} day(s), i.e. records since {since}."
         )
 
-    logging.info(f"Connecting to SQL Server database '{database}' on '{server}' ...")
-    conn = pyodbc.connect(conn_str, timeout=10)
-    logging.info("Database connection established.")
-    return conn
-
-
-def ensure_table_exists(db_conn, cfg):
-    table = cfg.get("Table", "table_name")
-    auto_create = cfg.getboolean("Table", "auto_create_table", fallback=False)
-
-    cursor = db_conn.cursor()
-    cursor.execute(
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = ?",
-        table,
-    )
-    exists = cursor.fetchone()[0] > 0
-
-    if exists:
+    logger.info(f"Fetching attendance records from device (since {since}) ...")
+    try:
+        records = fetch_attendance(cfg, logger)
+    except Exception as e:
+        logger.error(f"Failed to fetch attendance from device: {e}")
         return
 
-    if not auto_create:
-        raise RuntimeError(
-            f"Table '{table}' does not exist in the target database, and "
-            f"auto_create_table is disabled in config.ini. Either create the "
-            f"table yourself to match your existing schema, or set "
-            f"auto_create_table = true to let this script create a basic one."
+    if records is None:
+        records = []
+
+    # Only process punches newer than the last sync point, and remember
+    # the newest timestamp we successfully process so next run starts there.
+    new_records = [r for r in records if r.timestamp > since]
+    new_records.sort(key=lambda r: r.timestamp)
+
+    logger.info(f"{len(records)} total record(s) on device, {len(new_records)} new since last sync.")
+
+    if not new_records:
+        logger.info("Nothing new to sync.")
+        return
+
+    synced = 0
+    failed = 0
+    newest_ok_timestamp = since
+
+    for rec in new_records:
+        # pyzk Attendance record fields: user_id, timestamp, status, punch
+        # 'punch' / 'status' meaning varies by device firmware; map 0/1 -> IN/OUT
+        # when possible, otherwise omit and let Frappe auto-determine log_type.
+        log_type = None
+        punch_value = getattr(rec, "punch", None)
+        if punch_value == 0:
+            log_type = "IN"
+        elif punch_value == 1:
+            log_type = "OUT"
+
+        ok = push_checkin(cfg, logger, str(rec.user_id), rec.timestamp, log_type)
+        if ok:
+            synced += 1
+            if rec.timestamp > newest_ok_timestamp:
+                newest_ok_timestamp = rec.timestamp
+        else:
+            failed += 1
+            # Stop advancing the watermark past a failed record so it's
+            # retried next run, but keep trying the rest of the batch.
+
+    state["last_synced_timestamp"] = newest_ok_timestamp.isoformat()
+    state["last_run_at"] = datetime.now().isoformat()
+    state["last_run_synced"] = synced
+    state["last_run_failed"] = failed
+    save_state(state)
+
+    logger.info(f"Sync complete: {synced} synced, {failed} failed.")
+    if failed:
+        logger.warning(
+            f"{failed} record(s) failed to sync and will be retried next run "
+            f"(watermark held at {newest_ok_timestamp})."
         )
 
-    col_userid = cfg.get("Table", "col_userid")
-    col_checktime = cfg.get("Table", "col_checktime")
-    col_checktype = cfg.get("Table", "col_checktype")
-    col_verifycode = cfg.get("Table", "col_verifycode")
-    col_sensorid = cfg.get("Table", "col_sensorid")
-    col_sn = cfg.get("Table", "col_sn")
 
-    logging.warning(f"Table '{table}' not found - creating a basic version of it.")
-    create_sql = f"""
-        CREATE TABLE {table} (
-            {col_userid} VARCHAR(50) NOT NULL,
-            {col_checktime} DATETIME NOT NULL,
-            {col_checktype} CHAR(1) NULL,
-            {col_verifycode} INT NULL,
-            {col_sensorid} VARCHAR(50) NULL,
-            {col_sn} VARCHAR(50) NULL
-        )
-    """
-    cursor.execute(create_sql)
-    db_conn.commit()
-    logging.info(f"Table '{table}' created.")
-
-
-# ------------------------------------------------------------------------- #
-# Sync logic
-# ------------------------------------------------------------------------- #
-
-def record_exists(db_conn, cfg, user_id, check_time, device_sn):
-    table = cfg.get("Table", "table_name")
-    col_userid = cfg.get("Table", "col_userid")
-    col_checktime = cfg.get("Table", "col_checktime")
-    col_sn = cfg.get("Table", "col_sn")
-
-    cursor = db_conn.cursor()
-    query = (
-        f"SELECT COUNT(*) FROM {table} "
-        f"WHERE {col_userid} = ? AND {col_checktime} = ? AND {col_sn} = ?"
-    )
-    cursor.execute(query, str(user_id), check_time, device_sn)
-    return cursor.fetchone()[0] > 0
-
-
-def insert_record(db_conn, cfg, user_id, check_time, check_type, verify_code, sensor_id, device_sn):
-    table = cfg.get("Table", "table_name")
-    col_userid = cfg.get("Table", "col_userid")
-    col_checktime = cfg.get("Table", "col_checktime")
-    col_checktype = cfg.get("Table", "col_checktype")
-    col_verifycode = cfg.get("Table", "col_verifycode")
-    col_sensorid = cfg.get("Table", "col_sensorid")
-    col_sn = cfg.get("Table", "col_sn")
-
-    cursor = db_conn.cursor()
-    insert_sql = (
-        f"INSERT INTO {table} "
-        f"({col_userid}, {col_checktime}, {col_checktype}, {col_verifycode}, {col_sensorid}, {col_sn}) "
-        f"VALUES (?, ?, ?, ?, ?, ?)"
-    )
-    cursor.execute(
-        insert_sql,
-        str(user_id),
-        check_time,
-        str(check_type) if check_type is not None else None,
-        int(verify_code) if verify_code is not None else None,
-        str(sensor_id) if sensor_id is not None else None,
-        device_sn,
-    )
-    db_conn.commit()
-
-
-def sync_once(cfg):
-    device_conn = None
-    db_conn = None
-    inserted = 0
-    skipped = 0
-
+def run_continuous(cfg: dict, logger: logging.Logger) -> None:
+    interval = cfg["poll_interval_minutes"]
+    logger.info(f"Starting continuous sync loop, polling every {interval} minute(s). Ctrl+C to stop.")
     try:
-        device_conn = connect_device(cfg)
-        db_conn = get_db_connection(cfg)
-        ensure_table_exists(db_conn, cfg)
-
-        device_sn = cfg.get("Sync", "device_sn", fallback="").strip()
-        if not device_sn:
-            try:
-                device_sn = device_conn.get_serialnumber()
-            except Exception:
-                device_sn = "UNKNOWN"
-
-        logging.info("Disabling device (prevents new punches mid-transfer) ...")
-        device_conn.disable_device()
-
-        logging.info("Fetching attendance records from device ...")
-        attendances = device_conn.get_attendance()
-        logging.info(f"Retrieved {len(attendances)} punch records from device.")
-
-        for att in attendances:
-            user_id = att.user_id
-            check_time = att.timestamp
-            # punch: 0=Fingerprint,1=Password,others depending on device; status: check-in/out code
-            check_type = getattr(att, "punch", None)
-            verify_code = getattr(att, "status", None)
-            sensor_id = None  # not exposed per-record by pyzk; leave null unless you track per-device
-
-            if record_exists(db_conn, cfg, user_id, check_time, device_sn):
-                skipped += 1
-                continue
-
-            insert_record(
-                db_conn, cfg,
-                user_id, check_time, check_type, verify_code, sensor_id, device_sn,
-            )
-            inserted += 1
-
-        logging.info(f"Sync complete: {inserted} new record(s) inserted, {skipped} already existed.")
-
-        clear_after = cfg.getboolean("Sync", "clear_device_after_sync", fallback=False)
-        if clear_after and inserted > 0:
-            logging.info("clear_device_after_sync is enabled - clearing device attendance log ...")
-            device_conn.clear_attendance()
-            logging.info("Device attendance log cleared.")
-
-    finally:
-        if device_conn:
-            try:
-                device_conn.enable_device()
-                device_conn.disconnect()
-            except Exception:
-                pass
-        if db_conn:
-            db_conn.close()
-
-    return inserted, skipped
+        while True:
+            run_sync_once(cfg, logger)
+            logger.info(f"Sleeping {interval} minute(s) ...")
+            time.sleep(interval * 60)
+    except KeyboardInterrupt:
+        logger.info("Stopped by user (Ctrl+C).")
 
 
-# ------------------------------------------------------------------------- #
-# Utility commands
-# ------------------------------------------------------------------------- #
-
-def test_device(cfg):
-    conn = connect_device(cfg)
-    try:
-        sn = conn.get_serialnumber()
-        firmware = conn.get_firmware_version()
-        print(f"Connected OK. Serial number: {sn} | Firmware: {firmware}")
-    finally:
-        conn.disconnect()
-
-
-def test_db(cfg):
-    conn = get_db_connection(cfg)
-    cursor = conn.cursor()
-    cursor.execute("SELECT @@VERSION")
-    row = cursor.fetchone()
-    print(f"Connected OK. SQL Server version: {row[0][:60]}...")
-    conn.close()
-
-
-def list_users(cfg):
-    conn = connect_device(cfg)
-    try:
-        users = conn.get_users()
-        print(f"{len(users)} enrolled user(s):")
-        for u in users:
-            print(f"  UID={u.uid}  User ID={u.user_id}  Name={u.name}")
-    finally:
-        conn.disconnect()
-
-
-# ------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # Entry point
-# ------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="eSSL Biometric Device -> SQL Server Sync Tool")
-    parser.add_argument("--test-device", action="store_true", help="Test connection to the biometric device")
-    parser.add_argument("--test-db", action="store_true", help="Test connection to SQL Server")
-    parser.add_argument("--sync-once", action="store_true", help="Sync attendance once and exit")
-    parser.add_argument("--run", action="store_true", help="Sync continuously on the configured interval")
-    parser.add_argument("--list-users", action="store_true", help="List users enrolled on the device")
+    parser = argparse.ArgumentParser(description="eSSL/ZKTeco -> Frappe Employee Checkin sync")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--test-device", action="store_true", help="Test connection to the biometric device")
+    group.add_argument("--test-frappe", action="store_true", help="Test connection to the Frappe site")
+    group.add_argument("--list-users", action="store_true", help="List users enrolled on the device")
+    group.add_argument("--sync-once", action="store_true", help="Run one sync pass and exit")
+    group.add_argument("--run", action="store_true", help="Run continuously, polling on an interval")
     args = parser.parse_args()
 
-    cfg = load_config()
-    setup_logging(cfg)
+    cfg = get_config()
+    logger = setup_logging(cfg["log_level"])
 
     if args.test_device:
-        test_device(cfg)
-    elif args.test_db:
-        test_db(cfg)
-    elif args.list_users:
-        list_users(cfg)
-    elif args.sync_once:
-        sync_once(cfg)
-    elif args.run:
-        interval = cfg.getint("Sync", "poll_interval_minutes", fallback=5)
-        logging.info(f"Starting continuous sync loop - polling every {interval} minute(s). Ctrl+C to stop.")
-        while True:
-            try:
-                sync_once(cfg)
-            except Exception as e:
-                logging.error(f"Sync error: {e}")
-            time.sleep(interval * 60)
-    else:
-        parser.print_help()
+        ok = test_device(cfg, logger)
+        sys.exit(0 if ok else 1)
+
+    if args.test_frappe:
+        ok = test_frappe(cfg, logger)
+        sys.exit(0 if ok else 1)
+
+    if args.list_users:
+        ok = list_users(cfg, logger)
+        sys.exit(0 if ok else 1)
+
+    if args.run:
+        run_continuous(cfg, logger)
+        return
+
+    # default / --sync-once
+    run_sync_once(cfg, logger)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+[Unit]
+Description=eSSL -> Frappe Employee Checkin sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/essl-frappe-sync
+ExecStart=/opt/essl-frappe-sync/venv/bin/python /opt/essl-frappe-sync/essl_sync.py --sync-once
+User=essl-sync

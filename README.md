@@ -1,47 +1,52 @@
-# eSSL Biometric Device → SQL Server Sync Tool
+# eSSL Biometric Device → Frappe/ERPNext Sync Tool
 
-A standalone Python tool that connects to an eSSL biometric attendance device
-over TCP/IP, pulls punch logs, and writes new records into your SQL Server
-database (by default matching the standard `CHECKINOUT` table used by the
-`iclock` schema that eTimeTrackLite and similar eSSL/ZKTeco-based software use).
+Connects to an eSSL/ZKTeco biometric attendance device over TCP/IP, pulls
+punch logs, and creates **Employee Checkin** records in your Frappe/ERPNext
+site via the REST API.
 
-It will **not** duplicate records on repeated runs — it checks the DB for an
-existing matching row (user ID + timestamp + device serial) before inserting.
+It will **not** duplicate records on repeated runs — it keeps a local
+`sync_state.json` watermark of the last successfully-synced punch timestamp,
+and additionally treats "duplicate entry" responses from Frappe as already-synced.
 
 ---
 
 ## 1. Requirements
 
 - Python 3.8+
-- SQL Server ODBC driver installed on this machine
-  (**ODBC Driver 17 for SQL Server** — free download from Microsoft, search
-  "Microsoft ODBC Driver for SQL Server download")
 - Network access from this machine to:
   - the eSSL device (usually port `4370`)
-  - the SQL Server instance (usually port `1433`)
+  - your Frappe/ERPNext site (HTTPS, port 443)
+- A Frappe API Key + API Secret (User → Settings → API Access → Generate Keys)
+  for a user that has permission to create **Employee Checkin** records.
+- Every employee you want to sync must have their device's user ID entered
+  in the Employee doctype's **`attendance_device_id`** field in Frappe.
 
 Install Python dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirement.txt
 ```
 
 ---
 
 ## 2. Configure
 
-Open `config.ini` and fill in:
+```bash
+cp env.example .env
+nano .env
+```
 
-- **[Device]** — the device's IP address (check on the device: Menu → Comm → Ethernet).
-  Port 4370 is standard for eSSL/ZK-protocol devices unless changed on the device.
-- **[Database]** — your SQL Server address, the `iclock` database name, and login
-  credentials (or set `use_windows_auth = true` to use the account running the script).
-- **[Table]** — column names for your existing attendance table. The defaults
-  match the standard `CHECKINOUT` table schema (`USERID`, `CHECKTIME`, `CHECKTYPE`,
-  `VERIFYCODE`, `SENSORID`, `SN`). If your table/columns are named differently,
-  just change these values — the script uses them dynamically, no code edits needed.
-- **[Sync]** — polling interval for continuous mode, and whether to clear the
-  device's log after a successful sync (leave `false` until you trust the setup).
+Fill in:
+
+- **DEVICE_IP / DEVICE_PORT** — the device's IP (Menu → Comm → Ethernet on
+  the device). Port 4370 is standard for eSSL/ZK-protocol devices.
+- **FRAPPE_URL / FRAPPE_API_KEY / FRAPPE_API_SECRET** — your site URL and API
+  credentials.
+- **INITIAL_SYNC_DAYS** — on the very first run (no sync history yet), how
+  many days back to pull punches from.
+- **CLEAR_DEVICE_LOGS** — leave `false` until you've confirmed syncing works
+  reliably. The device's own log is your backup copy if something goes wrong.
+- **POLL_INTERVAL_MINUTES** — only used in `--run` continuous mode.
 
 ---
 
@@ -49,14 +54,13 @@ Open `config.ini` and fill in:
 
 ```bash
 python essl_sync.py --test-device
-python essl_sync.py --test-db
+python essl_sync.py --test-frappe
 python essl_sync.py --list-users
 ```
 
-Each should print a success message. Fix any connection errors here before
-moving on — they'll tell you immediately whether the problem is the device,
-the network, or the SQL Server login (same categories of error as the
-"Cannot open database" issue you were troubleshooting earlier).
+Each should print a success message. Fix connection errors here first —
+the messages will tell you whether the problem is the device, the network,
+or the Frappe API key/permissions.
 
 ---
 
@@ -68,37 +72,66 @@ One-time sync (good for testing):
 python essl_sync.py --sync-once
 ```
 
-Continuous sync (polls every N minutes, per `poll_interval_minutes` in config.ini):
+Continuous sync (polls every `POLL_INTERVAL_MINUTES`):
 
 ```bash
 python essl_sync.py --run
 ```
 
-Check `essl_sync.log` (created next to the script) for a full run history.
+## 5. Logs
+
+Everything is written to `essl_sync.log` next to the script (and echoed to
+the console), one line per event:
+
+```
+2026-07-09 19:20:01 [INFO] Fetching attendance records from device (since 2026-07-02 19:20:01) ...
+2026-07-09 19:20:03 [INFO] 42 total record(s) on device, 3 new since last sync.
+2026-07-09 19:20:04 [INFO] SYNCED user=107 time=2026-07-09 09:01:12 -> Employee Checkin HR-CHK-2026-00123
+2026-07-09 19:20:04 [ERROR] FAILED user=999 time=2026-07-09 09:05:00 -> no Employee found with attendance_device_id='999'. Check Employee master data in Frappe.
+2026-07-09 19:20:04 [INFO] Sync complete: 2 synced, 1 failed.
+```
+
+- Filter successes: `grep SYNCED essl_sync.log`
+- Filter errors: `grep ERROR essl_sync.log`
+- Failed records are **not** marked as synced, so they're retried automatically
+  on the next run.
 
 ---
 
-## 5. Running it automatically (Windows)
+## 6. Running it automatically (Linux / systemd)
 
-To keep this running in the background on your server, either:
+```bash
+sudo mkdir -p /opt/essl-frappe-sync
+sudo cp -r ./* /opt/essl-frappe-sync/
+cd /opt/essl-frappe-sync
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirement.txt
+cp env.example .env   # then edit .env
 
-- **Task Scheduler**: create a task that runs
-  `python C:\path\to\essl_sync.py --sync-once`
-  on a repeating trigger (e.g. every 5 minutes) — simplest and most reliable option.
-- **Long-running process**: run `python essl_sync.py --run` inside NSSM
-  (Non-Sucking Service Manager) to register it as a proper Windows service.
+sudo useradd -r -s /usr/sbin/nologin essl-sync
+sudo chown -R essl-sync:essl-sync /opt/essl-frappe-sync
 
-Task Scheduler is recommended for most setups — it's simpler to monitor and
-recovers cleanly if the script or device connection ever hangs.
+sudo cp essl_sync.service essl_sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now essl_sync.timer
+```
+
+Check it's running:
+
+```bash
+systemctl list-timers | grep essl_sync
+journalctl -u essl_sync.service -f
+tail -f /opt/essl-frappe-sync/essl_sync.log
+```
 
 ---
 
-## 6. Multiple devices
+## 7. Multiple devices
 
-For more than one eSSL device, either:
-- run separate copies of this folder with a different `config.ini` per device
-  (each pointing at the same DB table, differentiated by `device_sn`), or
-- ask me to extend the script to loop over a list of devices from one config file.
+Run separate copies of this folder (own `.env`, own `sync_state.json`) per
+device, each pointing at the same Frappe site — punches all land in the same
+Employee Checkin doctype regardless of which device produced them.
 
 ---
 
@@ -107,6 +140,7 @@ For more than one eSSL device, either:
 | Symptom | Likely cause |
 |---|---|
 | `--test-device` times out | Wrong IP, device on a different subnet/VLAN, or port 4370 blocked by firewall |
-| `--test-db` fails with login error | Wrong SQL username/password, or that login isn't mapped to the `iclock` database — same category of issue as the "Cannot open database" error you saw in the eTimeTrackLite app |
-| Records insert but with wrong/blank names | This tool syncs punches (user ID + timestamp) only, not names — names should already exist in your `USERINFO`/employee table from device enrollment sync, done separately |
-| Duplicate records appear | Check that `col_sn` (device serial) is populated correctly — if `device_sn` is blank and the device doesn't return one, this can affect the duplicate check across syncs |
+| `--test-frappe` fails with 401/403 | Wrong API key/secret, or that user lacks permission to read/create Employee Checkin |
+| Sync runs but no Checkins appear, log shows "no Employee found with attendance_device_id" | That device user ID isn't set in any Employee's `attendance_device_id` field in Frappe |
+| Duplicate records appear | Check `sync_state.json` wasn't deleted/reset — deleting it forces a full `INITIAL_SYNC_DAYS` re-pull |
+| Script works manually but not via systemd | Check `WorkingDirectory` and `ExecStart` paths in `essl_sync.service` match where you actually installed it, and that `essl-sync` user can read `.env` |
